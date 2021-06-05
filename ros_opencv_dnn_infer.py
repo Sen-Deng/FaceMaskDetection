@@ -1,3 +1,4 @@
+#encoding=utf-8
 import cv2
 import argparse
 import numpy as np
@@ -9,7 +10,18 @@ import rospy
 from sensor_msgs.msg import Image
 from cv_bridge import CvBridge, CvBridgeError
 import time 
+from utils import udp_send
+import face_recognition
 
+
+admin_img = face_recognition.load_image_file("faces/admin.jpg")
+admin_face_encoding = face_recognition.face_encodings(admin_img)[0]
+
+
+
+
+frame_cnt = 0
+frame_rate_limit = 6
 startTime = time.time()
 # anchor configuration
 feature_map_sizes = [[33, 33], [17, 17], [9, 9], [5, 5], [3, 3]]
@@ -27,6 +39,7 @@ id2class = {0: 'Mask', 1: 'NoMask'}
 id2chiclass = {0: 'r', 1: 'f'}
 colors = ((0, 255, 0), (255, 0 , 0))
 
+
 def puttext_chinese(img, text, point, color):
     pilimg = Image.fromarray(img)
     draw = ImageDraw.Draw(pilimg)  
@@ -38,6 +51,24 @@ def puttext_chinese(img, text, point, color):
     draw.text((point[0], y), text, color, font=font)
     img = np.asarray(pilimg)
     return img
+
+
+
+
+def recognition(image,face_locations):
+    ## do recognition when only one face show.
+    # print('recog size:',image.shape)
+    resize_rate = 0.25
+    ymin,xmax,ymax,xmin = [int(resize_rate*i) for i in face_locations]
+
+    small_frame = cv2.resize(image, (0, 0), fx=resize_rate, fy=resize_rate)
+    face_encoding = face_recognition.face_encodings(small_frame, [(ymin,xmax,ymax,xmin)])[0]
+    return face_recognition.compare_faces([admin_face_encoding], face_encoding,tolerance=0.4)
+
+
+
+
+
 
 def getOutputsNames(net):
     # Get the names of all the layers in the network
@@ -61,6 +92,9 @@ def inference(net, image, conf_thresh=0.5, iou_thresh=0.4, target_shape=(160, 16
     keep_idxs = single_class_non_max_suppression(y_bboxes, bbox_max_scores, conf_thresh=conf_thresh, iou_thresh=iou_thresh)
     # keep_idxs  = cv2.dnn.NMSBoxes(y_bboxes.tolist(), bbox_max_scores.tolist(), conf_thresh, iou_thresh)[:,0]
     tl = round(0.002 * (height + width) * 0.5) + 1  # line thickness
+
+
+    sending_data = ''
     for idx in keep_idxs:
         conf = float(bbox_max_scores[idx])
         class_id = bbox_max_score_classes[idx]
@@ -70,56 +104,73 @@ def inference(net, image, conf_thresh=0.5, iou_thresh=0.4, target_shape=(160, 16
         ymin = max(0, int(bbox[1] * height))
         xmax = min(int(bbox[2] * width), width)
         ymax = min(int(bbox[3] * height), height)
+
+
+        label,color = id2class[class_id],colors[class_id]
+        if len(keep_idxs) == 1:
+            match = recognition(image,[ymin,xmax,ymax,xmin])[0]
+            # print('recog:',match)
+        if match:
+            label = 'admin'
+            color = colors[0]
+            sending_data = 'admin:1'
+        elif class_id == 1:
+            sending_data = 'mask:0'
+        elif class_id == 0:
+            sending_data = 'mask:1'
+        # print('label:',label)
+        
+        if frame_cnt % 16 == 0:
+            udp_send.send_data(sending_data)
+
+
+
+        if ymin == 0:
+           sending_data = 'up'
+           udp_send.send_data(sending_data)
+  
+        if ymax == 2048:
+           sending_data = 'down'
+           udp_send.send_data(sending_data)
+      
+
+
+       
         if draw_result:
             cv2.rectangle(image, (xmin, ymin), (xmax, ymax), colors[class_id], thickness=10)
             if chinese:
                 image = puttext_chinese(image, id2chiclass[class_id], (xmin, ymin), colors[class_id])  ###puttext_chinese
             else:
-                cv2.putText(image, "%s: %.2f" % (id2class[class_id], conf), (xmin + 2, ymin - 2),
+                cv2.putText(image, "%s" % (label), (xmin + 2, ymin - 2),
                         # cv2.FONT_HERSHEY_SIMPLEX, 0.8, colors[class_id])
                         cv2.FONT_HERSHEY_SIMPLEX , 2, colors[class_id], 4)
     return image
 
-# def run_on_video(Net, video_path, conf_thresh=0.5):
-#     cap = cv2.VideoCapture(video_path)
-#     if not cap.isOpened():
-#         raise ValueError("Video open failed.")
-#         return
-#     status = True
-#     while status:
-#         status, img_raw = cap.read()
-#         if not status:
-#             print("Done processing !!!")
-#             break
-#         img_raw = cv2.cvtColor(img_raw, cv2.COLOR_BGR2RGB)
-#         img_raw = inference(Net, img_raw, target_shape=(260, 260), conf_thresh=conf_thresh)
-#         cv2.imshow('image', img_raw[:,:,::-1])
-#         cv2.waitKey(1)
-#     cv2.destroyAllWindows()
 
 def callback(data):
-    # define picture to_down' coefficient of ratio
-    scaling_factor = 0.5
-    global count,bridge,startTime
-    count = count + 1
-    # if count == 1:
-    #     count = 0
-    cv_img = bridge.imgmsg_to_cv2(data, "bgr8")     
-    cv_img = cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB)
-    result = inference(Net, cv_img, target_shape=(260, 260))
-    cv2.namedWindow('detect', cv2.WINDOW_NORMAL)
-    cv2.imshow('detect', result[:,:,::-1])
-    print(count/(time.time()-startTime))
-    #cv2.imshow("frame" , cv_img)
-    cv2.waitKey(3)      
-    # else:
-    #     pass
+    global startTime,frame_rate_limit,frame_rate,frame_cnt 
+    if frame_cnt % 30 == 0:  
+            frame_cnt = 1
+            startTime = time.time()
+    else:         
+            frame_rate = frame_cnt/(time.time()-startTime)   
+            #if frame_cnt % 5 == 0:
+                #print('FPS:',frame_rate)
+    if frame_rate <= frame_rate_limit:  
+            frame_cnt+=1
+            cv_img = bridge.imgmsg_to_cv2(data, "bgr8")     
+            cv_img = cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB)
+            result = inference(Net, cv_img, target_shape=(260, 260))
+            cv2.namedWindow('detect', cv2.WINDOW_NORMAL)
+            cv2.imshow('detect', result[:,:,::-1])
+            cv2.waitKey(3)      
+  
 
 def displayWebcam():
     rospy.init_node('webcam_display', anonymous=True)
-    # make a video_object and init the video object
-    global count,bridge
-    count = 0
+    global frame_cnt,startTime
+    frame_cnt = 1
+    startTime = time.time()
     bridge = CvBridge()
     rospy.Subscriber('/hikrobot_camera/rgb', Image, callback)
     rospy.spin()
